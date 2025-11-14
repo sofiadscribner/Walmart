@@ -1,0 +1,52 @@
+---
+title: "Walmart EDA"
+author: "Sofia Scribner"
+format: pdf
+editor: visual
+---
+
+```{r, echo=FALSE}
+
+# load packages
+
+library(tidyverse)
+library(tidymodels)
+
+# load data
+
+test <- read_csv('test.csv', show_col_types = F)
+train <- read_csv('train.csv', show_col_types = F)
+features <- read_csv('features.csv', show_col_types = F)
+```
+
+```{r}
+
+# How many stores does the features data include? What about the training data?
+
+n_distinct(train$Store)
+n_distinct(features$Store)
+
+# looks like they both contain 45 stores, however train has many more rows than features, probably because it has many more dates included
+
+length(train$Store)
+length(features$Store)
+```
+
+```{r}
+
+# investigate missing data
+
+sum(is.na(features$MarkDown1))
+```
+
+```{r}
+train %>%
+  count(Store, Dept)
+
+```
+
+o, three issues that I will need to consider when creating a predictive model for this data are:
+
+1.  Upon viewing the features and training data, I saw that they have data for the same 45 stores, but not the same dates. The training data has many more rows, because it includes more dates than the features data. I will have to figure out the best way to join them.
+2.  There is a lot of missing data, for example 4158 rows in the features data have NA values. I will need to decide how to deal with this.
+3.  Imbalanced data. There are some store/department combos, such as store 1 department 77 that only have a few observations.
