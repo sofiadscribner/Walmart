@@ -1,25 +1,266 @@
-# load packages
-
 library(tidyverse)
 library(tidymodels)
+library(vroom)
+library(DataExplorer)
+library(lubridate)
 
-# load data
+# ============================================================
+# Load data
+# ============================================================
 
-test <- read_csv('test.csv', show_col_types = F)
-train <- read_csv('train.csv', show_col_types = F)
-features <- read_csv('features.csv', show_col_types = F)
+test <- read_csv("test.csv", show_col_types = FALSE)
+train <- read_csv("train.csv", show_col_types = FALSE)
+features <- read_csv("features.csv", show_col_types = FALSE)
 
 
-# pre-prosessing
+# ============================================================
+# Pre-processing
+# ============================================================
 
 features <- features %>%
-  mutate(across(starts_with("Markdown"), ~ replace_na(., 0))) %>%
-  mutate(TotalMarkdown = rowSums(across(starts_with("Markdown")))) %>%
-  mutate(MarkdownFlag = if_else(TotalMarkdown > 0, 1, 0))%>%
-  select(-c(MarkDown1, MarkDown2, MarkDown3, MarkDown4, MarkDown5))
+  mutate(across(starts_with("MarkDown"), ~ replace_na(., 0))) %>%
+  mutate(across(starts_with("MarkDown"), ~ pmax(., 0))) %>%
+  mutate(
+    MarkDown_Total = rowSums(across(starts_with("MarkDown")), na.rm = TRUE),
+    MarkDown_Flag  = if_else(MarkDown_Total > 0, 1, 0),
+    MarkDown_Log   = log1p(MarkDown_Total)
+  ) %>%
+  select(-MarkDown1, -MarkDown2, -MarkDown3, -MarkDown4, -MarkDown5)
 
+
+# Impute CPI and Unemployment
+feature_recipe <- recipe(~ ., data = features) %>%
+  step_mutate(DecDate = decimal_date(Date)) %>%
+  step_impute_bag(CPI, Unemployment, impute_with = imp_vars(DecDate, Store))
+
+imputed_features <- prep(feature_recipe) %>% juice()%>%
+  select(-IsHoliday)
+
+
+# Join into train/test
 train <- train %>%
-  left_join(features, by = "Store", "Date", relationship = "many-to-many")
+  left_join(imputed_features, by = c("Store", "Date"))
 
 test <- test %>%
-  left_join(features, by = "Store", "Date", relationship = "many-to-many")
+  left_join(imputed_features, by = c("Store", "Date"))
+
+
+# ============================================================
+# LOG TRANSFORM RECIPE FOR MODELING
+# ============================================================
+
+store <- 14
+dept  <- 7
+
+train_sd <- train |> filter(Store == store, Dept == dept)
+test_sd  <- test  |> filter(Store == store, Dept == dept)
+
+
+sales_recipe <- recipe(Weekly_Sales ~ ., data = train_sd) %>%
+  step_mutate(
+    Date  = as.numeric(Date),
+    IsHoliday  = as.numeric(IsHoliday)
+  ) %>%
+  step_log(Weekly_Sales, offset = 1)
+
+
+# ============================================================
+# Penalized regression model
+# ============================================================
+
+tuned_preg_model <- linear_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet")
+
+tuned_preg_wf <- workflow() %>%
+  add_model(tuned_preg_model) %>%
+  add_recipe(sales_recipe)
+
+
+# ============================================================
+# CV Setup
+# ============================================================
+
+folds <- vfold_cv(train_sd, v = 5)
+
+
+# ============================================================
+# Run tuning
+# ============================================================
+
+tuning_grid <- grid_regular(
+  penalty(),
+  mixture(),
+  levels = 10
+)
+
+cv_results <- tune_grid(
+  tuned_preg_wf,
+  resamples = folds,
+  grid = tuning_grid,
+  metrics = metric_set(rmse)
+)
+
+
+# ============================================================
+# REPORT CV RMSE
+# ============================================================
+
+cv_summary <- cv_results %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  arrange(mean)
+
+print(cv_summary)
+
+best_cv <- show_best(cv_results, metric = "rmse", n = 1)
+print(best_cv)
+
+# best rmse for store 1 dept 1 penreg is 0.293
+# for store 7 dept 7 it's 0.405
+# for store 14 dept 8 it's 0.0917
+
+# so some combos it does really well, others not so much, but maybe it would average out
+# let's try a different model
+
+
+# ============================================================
+# Random forest model
+# ============================================================
+
+# Define model with tuning parameters
+rf_model <- rand_forest(
+  mtry = tune(),       # number of predictors sampled at each split
+  trees = 1000,        # number of trees
+  min_n = tune()       # min number of samples to split a node
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+# Workflow
+rf_wf <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(sales_recipe)
+
+# ============================================================
+# CV Setup
+# ============================================================
+
+folds <- vfold_cv(train_sd, v = 5)
+
+# ============================================================
+# Tuning grid
+# ============================================================
+
+rf_grid <- grid_regular(
+  mtry(range = c(1, ncol(train_sd) - 1)),
+  min_n(range = c(2, 10)),
+  levels = 5
+)
+
+# ============================================================
+# Run tuning
+# ============================================================
+
+cv_results_rf <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = rf_grid,
+  metrics = metric_set(rmse)
+)
+
+# ============================================================
+# REPORT CV RMSE
+# ============================================================
+
+cv_summary_rf <- cv_results_rf %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  arrange(mean)
+
+print(cv_summary_rf)
+
+best_cv_rf <- show_best(cv_results_rf, metric = "rmse", n = 1)
+print(best_cv_rf)
+
+# best rmse for store 1 dept 1 random forest is 0.264
+# for store 7 dept 7 it's 0.297
+# for store 14 dept 8 it's 0.0841
+
+# this did better than the penalized linear regression for these store/dept combos
+# let's try one more model
+
+
+library(tidymodels)
+library(lightgbm)
+library(tune)
+library(bonsai)
+# ============================================================
+# LightGBM model
+# ============================================================
+
+lgb_model <- boost_tree(
+  trees = 100,            # number of trees
+  tree_depth = 5,         # max depth
+  learn_rate = 0.1,       # learning rate
+  mtry = tune(),          # features sampled at each split
+  min_n = tune(),         # min samples per node
+  loss_reduction = tune() # min gain to split
+) %>%
+  set_engine("lightgbm") %>%
+  set_mode("regression")
+
+# Workflow
+lgb_wf <- workflow() %>%
+  add_model(lgb_model) %>%
+  add_recipe(sales_recipe)
+
+# ============================================================
+# CV Setup
+# ============================================================
+
+folds <- vfold_cv(train_sd, v = 5)
+
+# ============================================================
+# Tuning grid
+# ============================================================
+
+lgb_grid <- grid_regular(
+  mtry(range = c(2, 10)),
+  min_n(range = c(2, 20)),
+  loss_reduction(range = c(0, 5)),
+  levels = 3
+)
+
+# ============================================================
+# Run tuning
+# ============================================================
+
+lgb_cv_results <- tune_grid(
+  lgb_wf,
+  resamples = folds,
+  grid = lgb_grid,
+  metrics = metric_set(rmse)
+)
+
+# ============================================================
+# Report CV RMSE
+# ============================================================
+
+cv_summary_lgb <- lgb_cv_results %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  arrange(mean)
+
+print(cv_summary_lgb)
+
+best_cv_lgb <- show_best(lgb_cv_results, metric = "rmse", n = 1)
+print(best_cv_lgb)
+
+# best rmse for store 1 dept 1 lightGBM is 0.290
+# for store 7 dept 7 it's 0.405
+# for store 14 dept 8 it's 0.105
+
+# so the best model is random forest
