@@ -3,6 +3,7 @@ library(tidymodels)
 library(vroom)
 library(DataExplorer)
 library(lubridate)
+library(prophet)
 
 # ============================================================
 # Load data
@@ -263,4 +264,113 @@ print(best_cv_lgb)
 # for store 7 dept 7 it's 0.405
 # for store 14 dept 8 it's 0.105
 
-# so the best model is random forest
+# so the best model so far is random forest
+
+
+
+# TRYING THE PROPHET MODEL
+
+library(prophet)
+
+store <- 1
+dept <- 3
+
+store2 <- 8
+dept2 <- 2
+
+# filter and rename for prophet
+
+sd_train <- train %>%
+  filter(Store==store, Dept==dept)%>%
+  rename(y=Weekly_Sales, ds=Date)
+
+sd_test <- test %>%
+  filter(Store==store, Dept==dept)%>%
+  rename(ds=Date)
+# filter and rename for prophet
+
+sd_train2 <- train %>%
+  filter(Store==store2, Dept==dept2)%>%
+  rename(y=Weekly_Sales, ds=Date)
+
+sd_test2 <- test %>%
+  filter(Store==store2, Dept==dept2)%>%
+  rename(ds=Date)
+
+
+# fit prophet model
+
+prophet_model <- prophet()%>%
+  add_regressor("IsHoliday")%>%
+  add_regressor("Fuel_Price")%>%
+  add_regressor("MarkDown_Flag")%>%
+  fit.prophet(df=sd_train)
+
+# predict using prophet model
+
+fitted_vals <- predict(prophet_model, df=sd_train)
+test_preds <- predict(prophet_model, df=sd_test)
+
+
+# fit prophet model again
+
+prophet_model2 <- prophet()%>%
+  add_regressor("IsHoliday")%>%
+  add_regressor("Fuel_Price")%>%
+  add_regressor("MarkDown_Flag")%>%
+  fit.prophet(df=sd_train2)
+
+# predict using prophet model again
+
+fitted_vals2 <- predict(prophet_model2, df=sd_train2)
+test_preds2 <- predict(prophet_model2, df=sd_test2)
+
+# make plots
+
+library(patchwork)
+
+p1 <- ggplot() +
+  geom_line(data = sd_train, aes(x = ds, y = y, color = "Data")) +
+  geom_line(data = fitted_vals, aes(x = as.Date(ds), y = yhat, color = "Fitted")) +
+  geom_line(data = test_preds, aes(x = as.Date(ds), y = yhat, color = "Forecast")) +
+  scale_color_manual(values = c(
+    "Data" = "black",
+    "Fitted" = "cornflowerblue",
+    "Forecast" = "dark red"
+  )) +
+  labs(
+    title = "Projections for Store 1 Department 3",
+    x = "Date",
+    y = "Weekly Sales",
+    color = ""
+  )
+
+p2 <- ggplot() +
+  geom_line(data = sd_train2, aes(x = ds, y = y, color = "Data")) +
+  geom_line(data = fitted_vals2, aes(x = as.Date(ds), y = yhat, color = "Fitted")) +
+  geom_line(data = test_preds2, aes(x = as.Date(ds), y = yhat, color = "Forecast")) +
+  scale_color_manual(values = c(
+    "Data" = "black",
+    "Fitted" = "cornflowerblue",
+    "Forecast" = "dark red"
+  )) +
+  labs(
+    title = "Projections for Store 8 Department 2",
+    x = "Date",
+    y = "Weekly Sales",
+    color = ""
+  )
+
+p1 + p2
+
+combined_plot <- p1 + p2
+
+ggsave(
+  filename = "prophet_forecasts.jpg",
+  plot = combined_plot,
+  width = 12,        # adjust as needed
+  height = 6,        # adjust as needed
+  units = "in",
+  dpi = 300, 
+  bg = "white"
+)
