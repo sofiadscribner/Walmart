@@ -374,3 +374,188 @@ ggsave(
   dpi = 300, 
   bg = "white"
 )
+
+
+# modify dr heatons code
+
+## Libraries
+library(tidyverse)
+library(vroom)
+library(tidymodels)
+library(DataExplorer)
+library(zoo)
+library(lubridate)
+
+## Read in Data
+train <- vroom("./train.csv")
+test  <- vroom("./test.csv")
+features <- vroom("./features.csv")
+
+### Impute Missing Markdowns
+features <- features %>%
+  mutate(across(starts_with("MarkDown"), ~ replace_na(., 0))) %>%
+  mutate(across(starts_with("MarkDown"), ~ pmax(., 0))) %>%
+  mutate(
+    MarkDown_Total = rowSums(across(starts_with("MarkDown")), na.rm = TRUE),
+    MarkDown_Flag  = if_else(MarkDown_Total > 0, 1, 0),
+    MarkDown_Log   = log1p(MarkDown_Total)
+  ) %>%
+  select(-MarkDown1, -MarkDown2, -MarkDown3, -MarkDown4, -MarkDown5)
+
+## Impute Missing CPI & Unemployment
+feature_recipe <- recipe(~., data = features) %>%
+  step_mutate(DecDate = decimal_date(Date)) %>%
+  step_impute_bag(CPI, Unemployment, impute_with = imp_vars(DecDate, Store))
+
+imputed_features <- juice(prep(feature_recipe))
+
+########################
+## Merge into ONE PANEL
+########################
+
+# Add placeholder Weekly_Sales to test
+test2 <- test %>% mutate(Weekly_Sales = NA_real_)
+
+# Combine train + test
+full <- bind_rows(train, test2) %>%
+  left_join(imputed_features, by = c("Store", "Date")) %>%
+  select(-IsHoliday.y) %>%
+  rename(IsHoliday = IsHoliday.x) %>%
+  select(-MarkDown_Total) %>%
+  arrange(Store, Dept, Date)
+
+##########################
+## Create lag/rolling features ONCE globally
+##########################
+
+full <- full %>%
+  group_by(Store, Dept) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    # Short lags
+    lag_1   = lag(Weekly_Sales, 1),
+    lag_2   = lag(Weekly_Sales, 2),
+    lag_3   = lag(Weekly_Sales, 3),
+    
+    # Weekly/seasonal lags
+    lag_7   = lag(Weekly_Sales, 7),
+    lag_14  = lag(Weekly_Sales, 14),
+    lag_21  = lag(Weekly_Sales, 21),
+    lag_28  = lag(Weekly_Sales, 28),
+    
+    # Yearly + multi-year seasonality
+    lag_52  = lag(Weekly_Sales, 52),
+    lag_104 = lag(Weekly_Sales, 104),
+    
+    # Rolling features
+    roll_3 = rollmeanr(lag_1, 3, fill = NA),
+    roll_5 = rollmeanr(lag_1, 5, fill = NA),
+    roll_3_sd = rollapplyr(lag_1, 3, sd, fill = NA)
+  ) %>%
+  ungroup()
+
+########################
+## Precompute store/dept averages
+########################
+
+store_avg <- full %>%
+  filter(!is.na(Weekly_Sales)) %>%
+  group_by(Store) %>%
+  summarize(store_mean = mean(Weekly_Sales), .groups = "drop")
+
+dept_avg <- full %>%
+  filter(!is.na(Weekly_Sales)) %>%
+  group_by(Dept) %>%
+  summarize(dept_mean = mean(Weekly_Sales), .groups = "drop")
+
+########################
+## Split back into Train/Test
+########################
+
+fullTrain <- full %>% filter(!is.na(Weekly_Sales))
+fullTest  <- full %>% filter(is.na(Weekly_Sales)) %>%
+  select(-Weekly_Sales)
+
+##########################
+## LOOP THROUGH STORE–DEPT COMBOS
+##########################
+
+all_preds <- tibble(Id = character(), Weekly_Sales = numeric())
+n_storeDepts <- fullTest %>% distinct(Store, Dept) %>% nrow()
+cntr <- 0
+
+for(store in unique(fullTest$Store)){
+  
+  store_train <- fullTrain %>% filter(Store == store)
+  store_test  <- fullTest  %>% filter(Store == store)
+  
+  for(dept in unique(store_test$Dept)){
+    
+    dept_train <- store_train %>% filter(Dept == dept)
+    dept_test  <- store_test  %>% filter(Dept == dept)
+    
+    # Add precomputed averages
+    dept_train <- dept_train %>%
+      left_join(store_avg, by = "Store") %>%
+      left_join(dept_avg,  by = "Dept")
+    
+    dept_test <- dept_test %>%
+      left_join(store_avg, by = "Store") %>%
+      left_join(dept_avg,  by = "Dept")
+    
+    # Case 1: No training rows
+    if(nrow(dept_train) == 0){
+      preds <- dept_test %>%
+        transmute(
+          Id = paste(Store, Dept, Date, sep = "_"),
+          Weekly_Sales = 0
+        )
+      
+      # Case 2: Very small sample
+    } else if(nrow(dept_train) < 10){
+      preds <- dept_test %>%
+        transmute(
+          Id = paste(Store, Dept, Date, sep = "_"),
+          Weekly_Sales = mean(dept_train$Weekly_Sales)
+        )
+      
+      # Case 3: Random Forest (FAST)
+    } else {
+      
+      my_recipe <- recipe(Weekly_Sales ~ ., data = dept_train) %>%
+        step_mutate(Holiday = as.integer(IsHoliday)) %>%
+        step_date(Date, features = c("dow","week","month","quarter","year")) %>%
+        step_rm(Date, Store, Dept, IsHoliday) %>%
+        step_zv()
+      
+      rf_model <- rand_forest(
+        mtry = 5,
+        min_n = 5,
+        trees = 100
+      ) %>%
+        set_engine("ranger") %>%
+        set_mode("regression")
+      
+      final_wf <- workflow() %>%
+        add_recipe(my_recipe) %>%
+        add_model(rf_model) %>%
+        fit(dept_train)
+      
+      preds <- dept_test %>%
+        transmute(
+          Id = paste(Store, Dept, Date, sep = "_"),
+          Weekly_Sales = predict(final_wf, new_data = .) %>% pull(.pred)
+        )
+    }
+    
+    all_preds <- bind_rows(all_preds, preds)
+    
+    cntr <- cntr + 1
+    cat("Store", store,
+        "Dept", dept,
+        "Completed", round(100 * cntr / n_storeDepts, 1), "%\n")
+  }
+}
+
+## Save predictions
+vroom_write(all_preds, "./Predictions4.csv", delim = ",")
